@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>KTX 스마트 좌석 관리 시스템</title>
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;600&family=Noto+Sans+KR:wght@300;400;700&display=swap" rel="stylesheet">
+<script type="module">
+  import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-app.js";
+  import { getDatabase, ref, onValue, set, update, remove } from "https://www.gstatic.com/firebasejs/10.12.0/firebase-database.js";
+
+  const firebaseConfig = {
+    databaseURL: "https://ktx-seat-default-rtdb.firebaseio.com"
+  };
+  const app = initializeApp(firebaseConfig);
+  const db  = getDatabase(app);
+
+  const ROWS = 5, COLS = ['A','B','C','D'];
+  let localSeats = {};
+
+  function statusLabel(st) {
+    return {empty:'빈 자리', reserved:'예약됨', occupied:'점유됨'}[st] || '빈 자리';
+  }
+
+  // --- Grid ---
+  function buildGrid() {
+    const grid = document.getElementById('seat-grid');
+    grid.innerHTML = '';
+    const header = document.createElement('div');
+    header.className = 'seat-row';
+    header.innerHTML = `<div></div>
+      <div style="text-align:center;font-family:var(--mono);font-size:10px;color:var(--muted)">A</div>
+      <div style="text-align:center;font-family:var(--mono);font-size:10px;color:var(--muted)">B</div>
+      <div></div>
+      <div style="text-align:center;font-family:var(--mono);font-size:10px;color:var(--muted)">C</div>
+      <div style="text-align:center;font-family:var(--mono);font-size:10px;color:var(--muted)">D</div>`;
+    grid.appendChild(header);
+
+    for (let r = 1; r <= ROWS; r++) {
+      const row = document.createElement('div');
+      row.className = 'seat-row';
+      const rnum = document.createElement('div');
+      rnum.className = 'row-num'; rnum.textContent = r;
+      row.appendChild(rnum);
+      for (const c of COLS) {
+        if (c === 'C') row.appendChild(document.createElement('div'));
+        const id = `${r}${c}`;
+        const seat = document.createElement('div');
+        seat.className = 'seat empty';
+        seat.id = `seat-${id}`;
+        seat.innerHTML = `<span class="seat-id">${id}</span><span class="seat-status-text">빈 자리</span>`;
+        row.appendChild(seat);
+      }
+      grid.appendChild(row);
+    }
+  }
+
+  function updateSeatEl(id, st) {
+    const prev = localSeats[id];
+    localSeats[id] = st || 'empty';
+    const el = document.getElementById(`seat-${id}`);
+    if (!el) return;
+    const s = st || 'empty';
+    el.className = `seat ${s}`;
+    el.innerHTML = `<span class="seat-id">${id}</span><span class="seat-status-text">${statusLabel(s)}</span>`;
+    if (prev !== 'occupied' && s === 'occupied') {
+      el.classList.add('ble-flash');
+      setTimeout(() => el.classList.remove('ble-flash'), 700);
+      addLog(`좌석 ${id} 체크인 → 점유됨`, 'ble');
+    }
+    updateStats();
+  }
+
+  function updateStats() {
+    let e=0, r=0, o=0;
+    for (const st of Object.values(localSeats)) {
+      if (st==='reserved') r++;
+      else if (st==='occupied') o++;
+      else e++;
+    }
+    document.getElementById('cnt-empty').textContent = e;
+    document.getElementById('cnt-reserved').textContent = r;
+    document.getElementById('cnt-occupied').textContent = o;
+  }
+
+  // --- Firebase 실시간 리스닝 ---
+  function startListening() {
+    const seatsRef = ref(db, 'seats');
+    onValue(seatsRef, (snapshot) => {
+      const data = snapshot.val() || {};
+      // 모든 좌석 초기화 후 Firebase 데이터 반영
+      for (let r = 1; r <= ROWS; r++)
+        for (const c of COLS)
+          updateSeatEl(`${r}${c}`, data[`${r}${c}`]?.status || 'empty');
+
+      document.getElementById('conn-status').className = 'conn-status ok';
+      document.getElementById('conn-status').textContent = '● Firebase 연결됨';
+    }, (error) => {
+      document.getElementById('conn-status').className = 'conn-status err';
+      document.getElementById('conn-status').textContent = '● 연결 실패';
+    });
+  }
+
+  // --- 예약 ---
+  window.doReserve = async function() {
+    const id = document.getElementById('inp-reserve').value.toUpperCase().trim();
+    if (!id) return;
+    const ticketUUID = crypto.randomUUID();
+    await set(ref(db, `seats/${id}`), { status: 'reserved', uuid: ticketUUID });
+    await set(ref(db, `tickets/${ticketUUID}`), { seat_id: id });
+    addLog(`좌석 ${id} 예약 완료`, 'reserve');
+    document.getElementById('inp-reserve').value = '';
+  }
+
+  // --- 초기화 ---
+  window.doReset = async function() {
+    const id = document.getElementById('inp-reset').value.toUpperCase().trim();
+    if (!id) return;
+    await remove(ref(db, `seats/${id}`));
+    addLog(`좌석 ${id} 초기화`, 'system');
+    document.getElementById('inp-reset').value = '';
+  }
+
+  // --- 출발 (노쇼 처리) ---
+  window.doDepart = async function() {
+    const updates = {};
+    for (const [id, st] of Object.entries(localSeats)) {
+      if (st === 'reserved') updates[`seats/${id}`] = null;
+    }
+    if (Object.keys(updates).length === 0) {
+      addLog('노쇼 좌석 없음', 'system'); return;
+    }
+    await update(ref(db), updates);
+    addLog(`노쇼 ${Object.keys(updates).length}석 → 빈 자리 전환`, 'depart');
+    addLog('열차 출발 완료 🚄', 'depart');
+    const btn = document.getElementById('btn-depart');
+    btn.textContent = '🚄 출발 완료';
+    btn.classList.add('departed');
+    btn.disabled = true;
+  }
+
+  // --- Log ---
+  window.addLog = function(msg, type='') {
+    const area = document.getElementById('log-area');
+    const now = new Date();
+    const t = `${String(now.getHours()).padStart(2,'0')}:${String(now.getMinutes()).padStart(2,'0')}:${String(now.getSeconds()).padStart(2,'0')}`;
+    const entry = document.createElement('div');
+    entry.className = `log-entry ${type}`;
+    entry.innerHTML = `<span class="log-time">${t}</span>${msg}`;
+    area.appendChild(entry);
+    area.scrollTop = area.scrollHeight;
+  }
+
+  // --- Init ---
+  buildGrid();
+  startListening();
+  addLog('Firebase 연결 중...', 'system');
+</script>
+<style>
+  :root {
+    --bg:#0a0e1a; --panel:#111827; --border:#1e2d45;
+    --empty:#16a34a; --reserved:#ca8a04; --occupied:#dc2626;
+    --text:#e2e8f0; --muted:#64748b; --accent:#38bdf8;
+    --mono:'IBM Plex Mono',monospace; --sans:'Noto Sans KR',sans-serif;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;}
+  body{background:var(--bg);color:var(--text);font-family:var(--sans);min-height:100vh;padding:24px;}
+  .header{display:flex;align-items:flex-start;justify-content:space-between;margin-bottom:24px;border-bottom:1px solid var(--border);padding-bottom:20px;}
+  .header-left h1{font-family:var(--mono);font-size:22px;font-weight:600;color:var(--accent);}
+  .header-left p{font-size:12px;color:var(--muted);margin-top:4px;font-family:var(--mono);}
+  .conn-status{font-family:var(--mono);font-size:11px;padding:4px 10px;border-radius:4px;}
+  .conn-status.ok{color:var(--empty);background:rgba(22,163,74,.1);border:1px solid rgba(22,163,74,.3);}
+  .conn-status.err{color:var(--occupied);background:rgba(220,38,38,.1);border:1px solid rgba(220,38,38,.3);}
+  .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:12px;margin-bottom:28px;}
+  .stat-card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px;display:flex;align-items:center;gap:14px;}
+  .stat-dot{width:12px;height:12px;border-radius:50%;flex-shrink:0;}
+  .stat-dot.empty{background:var(--empty);box-shadow:0 0 8px rgba(22,163,74,.35);}
+  .stat-dot.reserved{background:var(--reserved);box-shadow:0 0 8px rgba(202,138,4,.35);}
+  .stat-dot.occupied{background:var(--occupied);box-shadow:0 0 8px rgba(220,38,38,.35);}
+  .stat-label{font-size:12px;color:var(--muted);}
+  .stat-count{font-family:var(--mono);font-size:24px;font-weight:600;line-height:1;}
+  .stat-count.empty{color:var(--empty);}
+  .stat-count.reserved{color:var(--reserved);}
+  .stat-count.occupied{color:var(--occupied);}
+  .main{display:grid;grid-template-columns:1fr 320px;gap:20px;}
+  .car-panel{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:24px;}
+  .car-label{font-family:var(--mono);font-size:11px;color:var(--muted);letter-spacing:1px;text-transform:uppercase;margin-bottom:20px;}
+  .seat-row{display:grid;grid-template-columns:32px 1fr 1fr 24px 1fr 1fr;align-items:center;gap:8px;margin-bottom:10px;}
+  .row-num{font-family:var(--mono);font-size:11px;color:var(--muted);text-align:center;}
+  .seat{height:52px;border-radius:8px;border:1.5px solid var(--border);background:#161f2e;transition:all .2s;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;}
+  .seat.empty{border-color:var(--empty);background:rgba(22,163,74,.08);box-shadow:inset 0 0 12px rgba(22,163,74,.1);}
+  .seat.reserved{border-color:var(--reserved);background:rgba(202,138,4,.08);box-shadow:inset 0 0 12px rgba(202,138,4,.1);}
+  .seat.occupied{border-color:var(--occupied);background:rgba(220,38,38,.08);box-shadow:inset 0 0 12px rgba(220,38,38,.1);}
+  .seat.ble-flash{animation:bleFlash .6s ease-out;}
+  @keyframes bleFlash{0%{box-shadow:0 0 0 0 rgba(56,189,248,.9);border-color:var(--accent)}100%{box-shadow:0 0 0 24px rgba(56,189,248,0)}}
+  .seat-id{font-family:var(--mono);font-size:12px;font-weight:600;}
+  .seat.empty .seat-id{color:var(--empty);}
+  .seat.reserved .seat-id{color:var(--reserved);}
+  .seat.occupied .seat-id{color:var(--occupied);}
+  .seat-status-text{font-size:9px;color:var(--muted);font-family:var(--mono);}
+  .legend{display:flex;gap:16px;margin-top:20px;padding-top:16px;border-top:1px solid var(--border);}
+  .legend-item{display:flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);}
+  .legend-dot{width:8px;height:8px;border-radius:50%;}
+  .control-panel{display:flex;flex-direction:column;gap:16px;}
+  .panel-section{background:var(--panel);border:1px solid var(--border);border-radius:12px;padding:18px;}
+  .panel-title{font-family:var(--mono);font-size:11px;color:var(--accent);letter-spacing:1px;text-transform:uppercase;margin-bottom:14px;}
+  .input-row{display:flex;gap:8px;margin-bottom:10px;}
+  .seat-input{flex:1;background:#0d1520;border:1px solid var(--border);border-radius:6px;color:var(--text);font-family:var(--mono);font-size:13px;padding:8px 12px;outline:none;transition:border-color .2s;}
+  .seat-input:focus{border-color:var(--accent);}
+  .seat-input::placeholder{color:var(--muted);}
+  .btn{padding:8px 14px;border-radius:6px;border:none;cursor:pointer;font-family:var(--mono);font-size:12px;font-weight:600;transition:all .15s;white-space:nowrap;}
+  .btn:hover{filter:brightness(1.15);transform:translateY(-1px);}
+  .btn-reserve{background:rgba(202,138,4,.2);color:var(--reserved);border:1px solid rgba(202,138,4,.4);}
+  .btn-reset{background:rgba(100,116,139,.15);color:var(--muted);border:1px solid rgba(100,116,139,.3);}
+  .btn-depart{width:100%;padding:12px;background:rgba(220,38,38,.15);color:var(--occupied);border:1px solid rgba(220,38,38,.4);font-size:13px;}
+  .btn-depart:disabled{opacity:.4;cursor:not-allowed;transform:none;filter:none;}
+  .btn-depart.departed{background:rgba(22,163,74,.1);color:var(--empty);border-color:rgba(22,163,74,.4);}
+  .log-area{background:#080d16;border:1px solid var(--border);border-radius:6px;padding:10px;height:160px;overflow-y:auto;font-family:var(--mono);font-size:11px;line-height:1.7;}
+  .log-entry{color:var(--muted);}
+  .log-entry.ble{color:var(--accent);}
+  .log-entry.reserve{color:var(--reserved);}
+  .log-entry.depart{color:var(--occupied);}
+  .log-entry.system{color:var(--empty);}
+  .log-time{color:#334155;margin-right:6px;}
+</style>
+</head>
+<body>
+<div class="header">
+  <div class="header-left">
+    <h1>KTX SEAT MGR</h1>
+    <p>KTX 101 · 서울 → 부산 · 07호차</p>
+  </div>
+  <span class="conn-status" id="conn-status">● 연결 중...</span>
+</div>
+
+<div class="stats">
+  <div class="stat-card"><div class="stat-dot empty"></div><div><div class="stat-label">빈 자리</div><div class="stat-count empty" id="cnt-empty">—</div></div></div>
+  <div class="stat-card"><div class="stat-dot reserved"></div><div><div class="stat-label">예약됨</div><div class="stat-count reserved" id="cnt-reserved">—</div></div></div>
+  <div class="stat-card"><div class="stat-dot occupied"></div><div><div class="stat-label">점유됨</div><div class="stat-count occupied" id="cnt-occupied">—</div></div></div>
+</div>
+
+<div class="main">
+  <div class="car-panel">
+    <div class="car-label">07호차 좌석 배치</div>
+    <div id="seat-grid"></div>
+    <div class="legend">
+      <div class="legend-item"><div class="legend-dot" style="background:var(--empty)"></div>빈 자리</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--reserved)"></div>예약됨</div>
+      <div class="legend-item"><div class="legend-dot" style="background:var(--occupied)"></div>점유됨</div>
+    </div>
+  </div>
+
+  <div class="control-panel">
+    <div class="panel-section">
+      <div class="panel-title">예약 등록</div>
+      <div class="input-row">
+        <input class="seat-input" id="inp-reserve" placeholder="예: 3A" maxlength="3">
+        <button class="btn btn-reserve" onclick="doReserve()">예약</button>
+      </div>
+    </div>
+
+    <div class="panel-section">
+      <div class="panel-title">좌석 초기화</div>
+      <div class="input-row">
+        <input class="seat-input" id="inp-reset" placeholder="예: 3A" maxlength="3">
+        <button class="btn btn-reset" onclick="doReset()">초기화</button>
+      </div>
+    </div>
+
+    <div class="panel-section">
+      <div class="panel-title">열차 제어</div>
+      <button class="btn btn-depart" id="btn-depart" onclick="doDepart()">🚄 열차 출발 (노쇼 처리)</button>
+      <div style="font-size:10px;color:var(--muted);margin-top:8px;font-family:var(--mono);">출발 시 예약됨(미체크인) → 빈 자리 전환</div>
+    </div>
+
+    <div class="panel-section" style="flex:1">
+      <div class="panel-title">시스템 로그</div>
+      <div class="log-area" id="log-area"></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>
